@@ -154,27 +154,33 @@ public:
     /**
      * training conv-net
      *
-     * @param in                 array of input data
-     * @param t                  array of training signals(label or vector)
-     * @param epoch              number of training epochs
-     * @param on_batch_enumerate callback for each mini-batch enumerate
-     * @param on_epoch_enumerate callback for each epoch 
-     * @param reset_weights      reset all weights or keep current
-     * @param n_threads          number of tasks
+     * @param in_size              number of training vectors
+     * @param input_data_function  function enumerating input data, taking a int in the range 0-(in_size-1)
+     *                             and returning a vec_t or const vec_t&
+     * @param output_data_function function enumerating expected results, taking a int in the range 0-(in_size-1),
+     *                             a second int (task id - can be ignored in most situations),
+     *                             and returning either a vec_t/const vec_t& (expected vector), 
+     *                             a label_t (expected label) or a pair<label_t, float_t> 
+     *                             (this last overload can be used to update a single value in the resulting vector)
+     * @param epoch                number of training epochs
+     * @param on_batch_enumerate   callback for each mini-batch enumerate
+     * @param on_epoch_enumerate   callback for each epoch 
+     * @param reset_weights        reset all weights or keep current
+     * @param n_threads            number of tasks
      */
-    template <typename OnBatchEnumerate, typename OnEpochEnumerate, typename T>
-    bool train(const std::vector<vec_t>& in,
-               const std::vector<T>&     t,
+    template <typename InputDataFunction, typename OutputDataFunction, typename OnBatchEnumerate, typename OnEpochEnumerate>
+    bool train(size_t in_size,
+               const InputDataFunction  &input_data_function,
+               const OutputDataFunction &output_data_function,
                size_t                    batch_size,
                int                       epoch,
-               OnBatchEnumerate          on_batch_enumerate,
-               OnEpochEnumerate          on_epoch_enumerate,
+               const OnBatchEnumerate   &on_batch_enumerate,
+               const OnEpochEnumerate   &on_epoch_enumerate,
 
                const bool                reset_weights = true,
                const int                 n_threads = CNN_TASK_SIZE
                )
     {
-        check_training_data(in, t);
         if (reset_weights)
             init_weight();
         layers_.set_parallelize(batch_size < CNN_TASK_SIZE);
@@ -182,9 +188,9 @@ public:
 
         for (int iter = 0; iter < epoch; iter++) {
             if (optimizer_.requires_hessian())
-                calc_hessian(in);
-            for (size_t i = 0; i < in.size(); i+=batch_size) {
-                train_once(&in[i], &t[i], std::min(batch_size, in.size() - i), n_threads);
+                calc_hessian(in_size, input_data_function);
+            for (size_t i = 0; i < in_size; i += batch_size) {
+                train_once(i, std::min(batch_size, in_size - i), input_data_function, output_data_function, n_threads);
                 on_batch_enumerate();
 
                 if (i % 100 == 0 && layers_.is_exploded()) {
@@ -195,6 +201,33 @@ public:
             on_epoch_enumerate();
         }
         return true;
+    }
+
+    /**
+     * training conv-net
+     *
+     * @param in                 array of input data
+     * @param t                  array of training signals(label, vector or update pair (see the other overload)
+     * @param epoch              number of training epochs
+     * @param on_batch_enumerate callback for each mini-batch enumerate
+     * @param on_epoch_enumerate callback for each epoch
+     * @param reset_weights      reset all weights or keep current
+     * @param n_threads          number of tasks
+     */
+    template <typename OnBatchEnumerate, typename OnEpochEnumerate, typename T>
+    bool train(const std::vector<vec_t>& in,
+               const std::vector<T>&     t,
+               size_t                    batch_size,
+               int                       epoch,
+               const OnBatchEnumerate    &on_batch_enumerate,
+               const OnEpochEnumerate    &on_epoch_enumerate,
+
+               const bool                reset_weights = true,
+               const int                 n_threads = CNN_TASK_SIZE
+               )
+    {
+        check_training_data(in, t);
+        return train(in.size(), [&in](int i) {return in[i]; }, [&t](int i) {return t[i]; }, batch_size, epoch, on_batch_enumerate, on_epoch_enumerate, reset_weights, n_threads);
     }
 
     /**
@@ -392,56 +425,48 @@ protected:
     }
 private:
 
-    void label2vector(const label_t* t, int num, std::vector<vec_t> *vec) const {
-        layer_size_t outdim = out_dim();
-
-        assert(num > 0);
-        assert(outdim > 0);
-
-        vec->reserve(num);
-        for (int i = 0; i < num; i++) {
-            assert(t[i] < outdim);
-            vec->emplace_back(outdim, target_value_min());
-            vec->back()[t[i]] = target_value_max();
-        }
+    vec_t label2vector(label_t t) const {
+        vec_t result(out_dim(), target_value_min());
+        result[t] = target_value_max();
+        return result;
     }
 
-    void train_once(const vec_t* in, const label_t* t, int size, const int nbThreads = CNN_TASK_SIZE) {
-        std::vector<vec_t> v;
-        label2vector(t, size, &v);
-        train_once(in, &v[0], size, nbThreads );
-    }
-
-    void train_once(const vec_t* in, const vec_t* t, int size, const int nbThreads = CNN_TASK_SIZE) {
-        if (size == 1) {
-            bprop(fprop(in[0]), t[0]);
+    template <typename InputDataFunction, typename OutputDataFunction>
+    void train_once(size_t in_offset, size_t in_size, const InputDataFunction &input_data_function, const OutputDataFunction &output_data_function, const int num_tasks = CNN_TASK_SIZE) {
+        if (in_size == 1) { // TODO: check if we really need this optimization, or the underlying threading frameworks will evaluate a single for_i in the main thread.
+            const auto &t = output_data_function(in_offset, 0); // Note: do not inline, this might use fprop on index i internally. No extra copy is performed: if output_data_functions returns a value rather than a reference, "temporary life extension" will keep it alive until end-of-scope.
+            bprop(fprop(input_data_function(0)), t);
             layers_.update_weights(&optimizer_, 1, 1);
         } else {
-            train_onebatch(in, t, size, nbThreads);
+            train_onebatch(in_offset, in_size, input_data_function, output_data_function, num_tasks);
         }
-    }   
-
-    void train_onebatch(const vec_t* in, const vec_t* t, int batch_size, const int num_tasks = CNN_TASK_SIZE) {
-        int num_threads = std::min(batch_size, num_tasks);
-        int data_per_thread = (batch_size + num_threads - 1) / num_threads;
-
-        for_i(num_threads, [&](int i) {
-            int start_index = i * data_per_thread;
-            int end_index = std::min(batch_size, start_index + data_per_thread);
-
-            for (int j = start_index; j < end_index; ++j)
-                bprop(fprop(in[j], i), t[j], i);
-        }, 1);
-        
-        // merge all dW and update W by optimizer
-        layers_.update_weights(&optimizer_, num_threads, batch_size);
     }
 
-    void calc_hessian(const std::vector<vec_t>& in, int size_initialize_hessian = 500) {
-        int size = std::min((int)in.size(), size_initialize_hessian);
+    template <typename InputDataFunction, typename OutputDataFunction>
+    void train_onebatch(size_t in_offset, size_t in_size, const InputDataFunction &input_data_function, const OutputDataFunction &output_data_function, const int num_tasks = CNN_TASK_SIZE) {
+        int num_threads = std::min(int(in_size), num_tasks);
+        int data_per_thread = (in_size + num_threads - 1) / num_threads;
+        int last_index = in_offset + in_size;
+        for_i(num_threads, [&](int i) {
+            int start_index = in_offset + i * data_per_thread;
+            int end_index = std::min(last_index, start_index + data_per_thread);
+
+            for (int j = start_index; j < end_index; ++j) {
+                const auto &t = output_data_function(j, i); // Note: do not inline, this might use fprop on index i internally. No extra copy is performed: if output_data_functions returns a value rather than a reference, "temporary life extension" will keep it alive until end-of-scope.
+                bprop(fprop(input_data_function(j), i), t, i);
+            }
+        }, 1);
+
+        // merge all dW and update W by optimizer
+        layers_.update_weights(&optimizer_, num_threads, in_size);
+    }
+
+    template <typename InputDataFunction>
+    void calc_hessian(size_t in_size, InputDataFunction &input_data_function, size_t size_initialize_hessian = 500) {
+        int size = std::min(in_size, size_initialize_hessian);
 
         for (int i = 0; i < size; i++)
-            bprop_2nd(fprop(in[i]));
+            bprop_2nd(fprop(input_data_function(i)));
 
         layers_.divide_hessian(size);
     }
@@ -456,7 +481,7 @@ private:
     }
 
     const vec_t& fprop(const vec_t& in, int idx = 0) {
-        if (in.size() != (size_t)in_dim())
+        if (in.size() != size_t(in_dim()))
             data_mismatch(*layers_[0], in);
         return layers_.head()->forward_propagation(in, idx);
     }
@@ -494,6 +519,32 @@ private:
             for (size_t i = 0; i < out_dim(); i++) {
                 vec_t dy_da = h.df(out, i);
                 delta[i] = vectorize::dot(&dE_dy[0], &dy_da[0], out_dim());
+            }
+        }
+
+        layers_.tail()->back_propagation(delta, idx);
+    }
+
+    void bprop(const vec_t& out, label_t t, int idx = 0) {
+        bprop(out, label2vector(t), idx);
+    }
+
+    void bprop(const vec_t& out, const std::pair<label_t, float_t>& t, int idx = 0) {
+        vec_t delta;
+        const activation::function& h = layers_.tail()->activation_function();
+
+        if (is_canonical_link(h)) {
+            delta.resize(out_dim(), float_t(0));
+            delta[t.first] = out[t.first] - t.second;
+        } else {
+            vec_t t_vector = out;
+            t_vector[t.first] = t.second;
+            vec_t dE_dy = gradient<E>(out, t_vector);
+            delta.reserve(out_dim());
+            // delta = dE/da = (dE/dy) * (dy/da)
+            for (size_t i = 0; i < out_dim(); i++) {
+                vec_t dy_da = h.df(out, i);
+                delta.push_back(vectorize::dot(&dE_dy[0], &dy_da[0], out_dim()));
             }
         }
 
